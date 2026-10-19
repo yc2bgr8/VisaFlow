@@ -20,6 +20,21 @@ export interface VisaMaterial {
   supersededBy?: string
   supersededAt?: string
   parseError?: string
+  recognition?: MaterialRecognition
+}
+export interface DocumentLine { text: string; bbox?: [number, number, number, number]; confidence?: number }
+export interface DocumentPage { pageNumber: number; method: 'pdf_text' | 'ocr'; text: string; lines: DocumentLine[]; width: number; height: number; previewBase64?: string; confidence?: number }
+export interface FieldSource { pageNumber: number; excerpt: string; bbox?: [number, number, number, number]; confidence?: number }
+export interface DocumentExtraction { pages: DocumentPage[]; fields: MaterialFields; fieldSources: Partial<Record<keyof MaterialFields, FieldSource>>; warnings: string[]; engine: string }
+export interface MaterialRecognition {
+  status: 'queued' | 'running' | 'needs_confirmation' | 'confirmed' | 'failed'
+  stage: string
+  engine?: string
+  warnings?: string[]
+  pageCount?: number
+  error?: string
+  confirmedAt?: string
+  confirmationNote?: string
 }
 export interface Evidence {
   id: string
@@ -30,6 +45,9 @@ export interface Evidence {
   excerpt: string
   sha256: string
   createdAt: string
+  pageNumber?: number
+  bbox?: [number, number, number, number]
+  method?: 'pdf_text' | 'ocr' | 'human_confirmation'
 }
 export interface ReviewCheck {
   id: string
@@ -114,11 +132,12 @@ export interface CaseDetail extends CaseSummary {
   traces: TraceEvent[]
 }
 export interface VisaFlowEvent {
-  type: 'case_updated' | 'review_progress' | 'review_complete' | 'review_failed' | 'approval_updated'
+  type: 'case_updated' | 'review_progress' | 'review_complete' | 'review_failed' | 'approval_updated' | 'material_progress'
   caseId: string
   taskId?: string
   stage?: string
   progress?: number
+  materialId?: string
 }
 export interface CreateCaseInput {
   applicantName: string
@@ -134,4 +153,5 @@ export interface ServiceOptions {
   autoRunTasks?: boolean
   /** Additional read/tool processes must not claim another live process crashed. */
   recoverOnStart?: boolean
+  documentExtractor?: (input: UploadMaterialInput, options: { cacheDir: string; signal: AbortSignal; onProgress: (stage: string) => void }) => Promise<DocumentExtraction>
 }

@@ -37,7 +37,7 @@ server.registerTool('get_rule_pack', {
 }))
 
 server.registerTool('list_materials', {
-  description: 'Read parsed material fields and SHA256 references within the current case. Unsupported PDFs remain manual-review items.',
+  description: 'Read material fields, PDF/OCR recognition status and SHA256 references within the current case. Only human-confirmed PDF/OCR fields may enter rule verification; pending, failed or missing fields are not verified facts. Human field confirmation remains in the desktop interface.',
   inputSchema: { caseId: z.string() }, annotations: readOnly,
 }, ({ caseId }) => execute(() => service.getCase(scoped(caseId)).materials))
 

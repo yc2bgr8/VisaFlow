@@ -4,12 +4,13 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DEMO_RULE_PACKS, addMonths, daysBetween, selectRulePack, validDate } from './rules.ts'
 import { DEMO_FIXTURES } from './fixtures.ts'
-import { hash, parseMaterial } from './materials.ts'
-import type { Approval, CaseDetail, CaseSummary, CreateCaseInput, Evidence, MaterialFields, ReviewCheck, ReviewTask, RulePack, ServiceOptions, TraceEvent, UploadMaterialInput, VisaFlowEvent, VisaMaterial } from './types.ts'
+import { hash, isRecognitionMaterial, parseMaterial } from './materials.ts'
+import { extractDocument } from './document-extraction.ts'
+import type { Approval, CaseDetail, CaseSummary, CreateCaseInput, DocumentExtraction, Evidence, MaterialFields, ReviewCheck, ReviewTask, RulePack, ServiceOptions, TraceEvent, UploadMaterialInput, VisaFlowEvent, VisaMaterial } from './types.ts'
 
 type Row = { data: string }
 type JsonTable = 'cases' | 'materials' | 'evidence' | 'tasks' | 'approvals' | 'traces' | 'checks'
-type StoredMaterial = VisaMaterial & { rawText: string; rawBase64: string }
+type StoredMaterial = VisaMaterial & { rawText: string; rawBase64: string; extraction?: DocumentExtraction }
 const now = (): string => new Date().toISOString()
 const id = (kind: string): string => `${kind}_${randomUUID()}`
 const labels = { passport: '护照', bank_statement: '银行流水', application: '申请表' } as const
@@ -27,12 +28,18 @@ export class VisaFlowService {
   private autoRun: boolean
   private closed = false
   private timers = new Set<ReturnType<typeof setTimeout>>()
+  private documentExtractor: NonNullable<ServiceOptions['documentExtractor']>
+  private cacheDir: string
+  private recognitionChain = Promise.resolve()
+  private recognitionControllers = new Set<AbortController>()
 
   constructor(options: ServiceOptions) {
     mkdirSync(options.dataDir, { recursive: true })
     this.db = new DatabaseSync(join(options.dataDir, 'visaflow.sqlite'))
     this.eventCallback = options.onEvent
     this.autoRun = options.autoRunTasks !== false
+    this.cacheDir = join(options.dataDir, 'ocr-cache')
+    this.documentExtractor = options.documentExtractor ?? extractDocument
     this.db.exec(`
       PRAGMA foreign_keys=ON;
       PRAGMA journal_mode=WAL;
@@ -56,12 +63,22 @@ export class VisaFlowService {
       CREATE INDEX IF NOT EXISTS traces_case ON traces(case_id);
     `)
     if (options.recoverOnStart !== false) this.recover()
+    if (options.recoverOnStart !== false) {
+      for (const material of this.rows<StoredMaterial>('SELECT data FROM materials')) {
+        if (material.recognition?.status === 'running') {
+          material.recognition = { status: 'queued', stage: '服务重启后重新识别' }
+          this.saveMaterial(material)
+        }
+        if (material.recognition?.status === 'queued') this.scheduleRecognition(material.id)
+      }
+    }
   }
 
   close(): void {
     this.closed = true
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
+    for (const controller of this.recognitionControllers) controller.abort()
     this.db.close()
   }
 
@@ -131,7 +148,7 @@ export class VisaFlowService {
   getCase(caseId: string): CaseDetail {
     const value = this.summary(this.caseRecord(caseId))
     const materials = this.rows<StoredMaterial>('SELECT data FROM materials WHERE case_id=? ORDER BY rowid', caseId)
-      .map(({ rawText: _text, rawBase64: _bytes, ...material }) => material)
+      .map(({ rawText: _text, rawBase64: _bytes, extraction: _extraction, ...material }) => material)
     return {
       ...value, materials,
       checks: value.latestTaskId ? this.rows<ReviewCheck>('SELECT data FROM checks WHERE task_id=? ORDER BY rowid', value.latestTaskId) : [],
@@ -173,11 +190,12 @@ export class VisaFlowService {
     const parsed = parseMaterial(input)
     const existingMaterials = this.rows<StoredMaterial>('SELECT data FROM materials WHERE case_id=?', caseId)
     const duplicate = existingMaterials.find(material => material.active !== false && material.sha256 === parsed.sha256 && material.name === input.name)
-    if (duplicate) { const { rawText: _text, rawBase64: _bytes, ...material } = duplicate; return material }
+    if (duplicate) { const { rawText: _text, rawBase64: _bytes, extraction: _extraction, ...material } = duplicate; return material }
     const material: StoredMaterial = {
       id: id('material'), caseId, name: input.name.trim(), mimeType: input.mimeType || 'application/octet-stream',
       sha256: parsed.sha256, uploadedAt: now(), fields: parsed.fields, active: true,
       ...(parsed.parseError ? { parseError: parsed.parseError } : {}), rawText: parsed.text, rawBase64: input.contentBase64,
+      ...(isRecognitionMaterial(input) ? { recognition: { status: 'queued' as const, stage: '等待本地 PDF / OCR 识别' } } : {}),
     }
     this.transaction(() => {
       this.db.prepare('INSERT INTO materials(id,case_id,data) VALUES(?,?,?)').run(material.id, caseId, JSON.stringify(material))
@@ -200,7 +218,125 @@ export class VisaFlowService {
       this.trace(caseId, 'material_uploaded', { materialId: material.id, name: material.name, sha256: material.sha256, fields: material.fields, parseError: material.parseError ?? null })
     })
     this.emit({ type: 'case_updated', caseId })
-    const { rawText: _text, rawBase64: _bytes, ...publicMaterial } = material
+    if (material.recognition) this.scheduleRecognition(material.id)
+    const { rawText: _text, rawBase64: _bytes, extraction: _extraction, ...publicMaterial } = material
+    return publicMaterial
+  }
+
+  private saveMaterial(material: StoredMaterial): void {
+    this.db.prepare('UPDATE materials SET data=? WHERE id=?').run(JSON.stringify(material), material.id)
+  }
+
+  private scheduleRecognition(materialId: string): void {
+    if (!this.autoRun || this.closed) return
+    this.recognitionChain = this.recognitionChain.then(async () => { if (!this.closed) await this.runMaterialRecognition(materialId) }).catch(() => {})
+  }
+
+  async runMaterialRecognition(materialId: string): Promise<void> {
+    const material = this.read<StoredMaterial>('materials', materialId)
+    if (!material || material.recognition?.status !== 'queued' || this.closed) return
+    material.recognition = { status: 'running', stage: '正在读取材料' }
+    const claimed = this.db.prepare("UPDATE materials SET data=? WHERE id=? AND json_extract(data,'$.recognition.status')='queued'").run(JSON.stringify(material), material.id)
+    if (Number(claimed.changes) !== 1) return
+    const controller = new AbortController()
+    this.recognitionControllers.add(controller)
+    const progress = (stage: string) => {
+      if (this.closed) return
+      material.recognition!.stage = stage
+      this.saveMaterial(material)
+      this.emit({ type: 'material_progress', caseId: material.caseId, materialId: material.id, stage })
+    }
+    progress('正在读取材料')
+    try {
+      const result = await this.documentExtractor({ name: material.name, mimeType: material.mimeType, contentBase64: material.rawBase64 }, { cacheDir: this.cacheDir, signal: controller.signal, onProgress: progress })
+      if (this.closed) return
+      material.extraction = result; material.rawText = result.pages.map(page => `--- 第 ${page.pageNumber} 页 ---\n${page.text}`).join('\n\n')
+      material.fields = result.fields
+      material.parseError = '识别字段尚未人工确认，不能作为已核验材料。'
+      material.recognition = { status: 'needs_confirmation', stage: '识别完成，等待确认字段', engine: result.engine, pageCount: result.pages.length, warnings: result.warnings }
+      this.transaction(() => {
+        this.saveMaterial(material)
+        for (const page of result.pages) {
+          const evidence = this.addEvidence(material.caseId, material.id, material.name, `识别原文 / 第 ${page.pageNumber} 页`, page.text, material.sha256)
+          evidence.pageNumber = page.pageNumber; evidence.method = page.method
+          this.db.prepare('UPDATE evidence SET data=? WHERE id=?').run(JSON.stringify(evidence), evidence.id)
+        }
+        this.trace(material.caseId, 'material_recognized', { materialId: material.id, pageCount: result.pages.length, engine: result.engine, requiresConfirmation: true })
+      })
+    } catch (error) {
+      if (this.closed) return
+      const message = error instanceof Error ? error.message : '材料识别失败'
+      material.fields = { documentType: 'unknown' }
+      material.parseError = message
+      material.recognition = { status: 'failed', stage: '识别失败', error: message }
+      this.transaction(() => { this.saveMaterial(material); this.trace(material.caseId, 'material_recognition_failed', { materialId: material.id, error: message }) })
+    } finally {
+      this.recognitionControllers.delete(controller)
+      if (!this.closed) this.emit({ type: 'material_progress', caseId: material.caseId, materialId: material.id, stage: material.recognition?.stage })
+    }
+  }
+
+  getMaterialRecognition(caseId: string, materialId: string): { material: VisaMaterial; extraction?: DocumentExtraction; text: string } {
+    this.caseRecord(caseId)
+    const material = this.read<StoredMaterial>('materials', materialId)
+    if (!material || material.caseId !== caseId) throw new Error('材料不属于当前案件')
+    const { rawText, rawBase64: _bytes, extraction, ...publicMaterial } = material
+    return { material: publicMaterial, text: rawText, ...(extraction ? { extraction } : {}) }
+  }
+
+  retryMaterialRecognition(caseId: string, materialId: string): VisaMaterial {
+    const value = this.caseRecord(caseId)
+    if (value.status === 'reviewing') throw new Error('核验进行中，暂不能重新识别')
+    const material = this.read<StoredMaterial>('materials', materialId)
+    if (!material || material.caseId !== caseId) throw new Error('材料不属于当前案件')
+    if (!material.active || material.recognition?.status !== 'failed') throw new Error('仅可重试未替换且识别失败的材料')
+    material.recognition = { status: 'queued', stage: '等待重新识别' }; material.parseError = '等待 PDF / OCR 重新识别'
+    this.saveMaterial(material); this.scheduleRecognition(material.id)
+    this.emit({ type: 'case_updated', caseId })
+    const { rawText: _text, rawBase64: _bytes, extraction: _extraction, ...publicMaterial } = material
+    return publicMaterial
+  }
+
+  confirmMaterialFields(caseId: string, materialId: string, fields: MaterialFields, note: string): VisaMaterial {
+    const value = this.caseRecord(caseId)
+    if (value.status === 'reviewing') throw new Error('核验进行中，暂不能确认或修改材料')
+    const original = this.read<StoredMaterial>('materials', materialId)
+    if (!original || original.caseId !== caseId) throw new Error('材料不属于当前案件')
+    if (!original.active || original.recognition?.status !== 'needs_confirmation') throw new Error('材料当前状态不能确认，请刷新后重试')
+    if (!note?.trim() || note.length > 1000) throw new Error('请填写 1–1000 字的核对说明')
+    if (!fields || !['passport', 'application', 'bank_statement'].includes(fields.documentType)) throw new Error('请选择有效的材料类型')
+    const sanitized: MaterialFields = { documentType: fields.documentType }
+    for (const field of ['applicantName', 'passportNumber', 'expiryDate', 'issuedDate'] as const) {
+      const content = fields[field]
+      if (content !== undefined && (typeof content !== 'string' || content.length > 120)) throw new Error('材料字段格式无效')
+      if (content?.trim()) sanitized[field] = content.trim()
+    }
+    if (fields.balance !== undefined) { if (typeof fields.balance !== 'number' || !Number.isFinite(fields.balance) || fields.balance < 0) throw new Error('余额必须是非负数'); sanitized.balance = fields.balance }
+    for (const field of ['expiryDate', 'issuedDate'] as const) if (sanitized[field] && !validDate(sanitized[field])) throw new Error('日期必须是有效的 YYYY-MM-DD')
+    if (sanitized.passportNumber && !/^[A-Z0-9]{6,12}$/i.test(sanitized.passportNumber)) throw new Error('请核对护照号码，仅允许 6–12 位字母数字')
+    if (sanitized.passportNumber) sanitized.passportNumber = sanitized.passportNumber.toUpperCase()
+    const confirmed: StoredMaterial = { ...original, id: id('material'), uploadedAt: now(), fields: sanitized, recognition: { ...original.recognition, status: 'confirmed', stage: '字段已人工确认', confirmedAt: now(), confirmationNote: note.trim() } }
+    delete confirmed.parseError
+    this.transaction(() => {
+      const current = this.read<StoredMaterial>('materials', original.id)
+      if (!current?.active || current.recognition?.status !== 'needs_confirmation') throw new Error('材料已被其他操作确认，请刷新后重试')
+      this.db.prepare('INSERT INTO materials(id,case_id,data) VALUES(?,?,?)').run(confirmed.id, caseId, JSON.stringify(confirmed))
+      for (const previous of this.rows<StoredMaterial>('SELECT data FROM materials WHERE case_id=?', caseId).filter(item => item.active !== false && item.id !== confirmed.id && (item.id === original.id || item.fields.documentType === sanitized.documentType))) {
+        previous.active = false; previous.supersededBy = confirmed.id; previous.supersededAt = now(); this.saveMaterial(previous)
+      }
+      for (const [field, content] of Object.entries(sanitized)) {
+        if (content == null || field === 'documentType') continue
+        const source = original.extraction?.fieldSources[field as keyof MaterialFields]
+        const evidence = this.addEvidence(caseId, confirmed.id, confirmed.name, `字段 /${field}`, `${field}: ${content}\n${source ? `第 ${source.pageNumber} 页识别原文：${source.excerpt}` : '人工补录字段'}\n人工核对：${note.trim()}`, confirmed.sha256)
+        evidence.method = 'human_confirmation'; if (source) { evidence.pageNumber = source.pageNumber; evidence.bbox = source.bbox }
+        this.db.prepare('UPDATE evidence SET data=? WHERE id=?').run(JSON.stringify(evidence), evidence.id)
+      }
+      this.invalidatePendingApprovals(caseId, '识别材料字段已确认或修改，需重新核验')
+      value.status = 'collecting'; value.latestTaskId = undefined; value.rulePackId = undefined; this.updateCase(value)
+      this.trace(caseId, 'material_fields_confirmed', { originalMaterialId: original.id, materialId: confirmed.id, fields: sanitized, note: note.trim(), sha256: confirmed.sha256 })
+    })
+    this.emit({ type: 'case_updated', caseId })
+    const { rawText: _text, rawBase64: _bytes, extraction: _extraction, ...publicMaterial } = confirmed
     return publicMaterial
   }
 
@@ -215,12 +351,14 @@ export class VisaFlowService {
     this.caseRecord(caseId)
     const material = this.read<StoredMaterial>('materials', materialId)
     if (!material || material.caseId !== caseId) throw new Error('材料不属于当前案件')
-    const { rawText, rawBase64: _bytes, ...publicMaterial } = material
+    const { rawText, rawBase64: _bytes, extraction: _extraction, ...publicMaterial } = material
     return { material: publicMaterial, text: rawText }
   }
 
   startReview(caseId: string): { accepted: true; taskId: string } {
     const value = this.caseRecord(caseId)
+    const recognitionPending = this.rows<StoredMaterial>('SELECT data FROM materials WHERE case_id=?', caseId).some(material => material.active !== false && material.recognition && ['queued', 'running', 'needs_confirmation'].includes(material.recognition.status))
+    if (recognitionPending) throw new Error('请先等待 PDF / OCR 完成，并人工确认识别字段后再核验。')
     if (value.latestTaskId) {
       const previous = this.read<ReviewTask>('tasks', value.latestTaskId)
       if (previous && (previous.status === 'queued' || previous.status === 'running')) return { accepted: true, taskId: previous.id }

@@ -167,6 +167,22 @@
 .vf-report-summary { padding:11px 12px; border-radius:7px; background:#f4f8f4; color:#7b9683; line-height:1.8; font-size:10px; margin-bottom:10px; }
 .vf-report-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:9px; color:#a0ada2; margin-bottom:13px; }
 .vf-spin { animation:vf-spin 1s linear infinite; }
+.vf-recognition-modal { width:min(1120px,96vw); max-height:92vh; overflow:auto; }
+.vf-recognition-heading { display:flex; justify-content:space-between; gap:20px; }
+.vf-recognition-heading p { margin-bottom:10px; }
+.vf-recognition-columns { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr); gap:24px; }
+.vf-recognition-source { background:#f5f8f6; padding:14px; border-radius:10px; overflow:hidden; }
+.vf-recognition-source img { width:100%; max-height:430px; object-fit:contain; background:white; margin:10px 0; }
+.vf-recognition-preview { display:block; width:100%; max-height:430px; background:white; margin:10px 0; }
+.vf-recognition-page-picker { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.vf-recognition-page-picker select { width:auto; }
+.vf-recognition-source pre { font-size:11px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; max-height:230px; overflow:auto; }
+.vf-recognition-source small { display:block; overflow-wrap:anywhere; color:#819587; margin-top:12px; font-size:10px; }
+.vf-recognition-fields h3 { margin:0 0 12px; font-size:14px; }
+.vf-recognition-warning { padding:8px 10px; border-radius:6px; margin-bottom:7px; font-size:11px; line-height:1.6; background:#fff7e7; color:#87651f; }
+.vf-source-link { display:block; border:0; background:none; text-align:left; color:#228474; margin-top:5px; font-size:10px; cursor:pointer; max-width:100%; overflow-wrap:anywhere; }
+.vf-ocr-state { margin:8px 0; font-size:11px; color:#42695a; display:flex; gap:6px; align-items:center; }
+@media(max-width:740px) { .vf-recognition-columns { grid-template-columns:1fr; } }
 @keyframes vf-spin { to { transform:rotate(360deg); } }
 .vf-page-note { display:flex; gap:8px; align-items:flex-start; color:#9aaba0; font-size:10px; margin-top:16px; line-height:1.8; }
 .vf-table-wrap { overflow:auto; }

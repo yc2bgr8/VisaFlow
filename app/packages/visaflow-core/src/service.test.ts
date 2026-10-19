@@ -96,12 +96,15 @@ describe('VisaFlow deterministic review', () => {
     expect(service.getCase(created.id).tasks[0]?.status).toBe('completed')
   })
 
-  test('unsupported PDF never invents parsed facts and cross-case raw access is rejected', () => {
+  test('corrupt PDF fails recognition without inventing facts and cross-case raw access is rejected', async () => {
     const { service } = setup()
     const first = service.createCase({ applicantName: '甲', visaType: 'demo-tourist', submissionDate: '2026-10-12' })
     const second = service.createCase({ applicantName: '乙', visaType: 'demo-tourist', submissionDate: '2026-10-12' })
     const material = service.addMaterial(first.id, { name: 'passport.pdf', mimeType: 'application/pdf', contentBase64: Buffer.from('%PDF-1.7 unsupported demo').toString('base64') })
     expect(material.parseError).toContain('OCR')
+    expect(() => service.startReview(first.id)).toThrow('人工确认')
+    await service.runMaterialRecognition(material.id)
+    expect(service.getCase(first.id).materials[0]?.recognition?.status).toBe('failed')
     expect(() => service.getRawMaterial(second.id, material.id)).toThrow('材料不属于当前案件')
     service.runReview(service.startReview(first.id).taskId)
     expect(service.getCase(first.id).checks.some(check => check.status === 'needs_review' && check.code.startsWith('parse:'))).toBe(true)

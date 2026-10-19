@@ -34,6 +34,9 @@ export function registerVisaFlowHandlers(server: RpcServer, deps: HandlerDeps): 
       case 'getRulePacks': return service.getRulePacks()
       case 'exportTrace': return service.exportTrace(text(payload.caseId, 'caseId'))
       case 'getRawMaterial': return service.getRawMaterial(text(payload.caseId, 'caseId'), text(payload.materialId, 'materialId'))
+      case 'getMaterialRecognition': return service.getMaterialRecognition(text(payload.caseId, 'caseId'), text(payload.materialId, 'materialId'))
+      case 'retryMaterialRecognition': return service.retryMaterialRecognition(text(payload.caseId, 'caseId'), text(payload.materialId, 'materialId'))
+      case 'confirmMaterialFields': return service.confirmMaterialFields(text(payload.caseId, 'caseId'), text(payload.materialId, 'materialId'), object(payload.fields) as unknown as import('../../../../visaflow-core/src/types').MaterialFields, text(payload.note, '核对说明'))
       case 'getOutbox': return service.getOutbox(text(payload.caseId, 'caseId'))
       case 'createCase':
         return service.createCase({

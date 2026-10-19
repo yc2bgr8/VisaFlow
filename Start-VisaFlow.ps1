@@ -1,4 +1,4 @@
-param([switch]$Rebuild, [switch]$NoLaunch)
+param([switch]$Rebuild, [switch]$NoLaunch, [int]$DebugPort = 0)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Join-Path $PSScriptRoot 'app'
 Set-Location -LiteralPath $projectRoot
@@ -32,12 +32,12 @@ foreach ($inheritedOption in @('ELECTRON_RUN_AS_NODE', 'VITE_DEV_SERVER_URL', 'C
     Remove-Item -LiteralPath ('Env:' + $inheritedOption) -ErrorAction SilentlyContinue
 }
 
-if (!(Test-Path -LiteralPath (Join-Path $projectRoot 'node_modules\electron\dist\electron.exe'))) {
+if (!(Test-Path -LiteralPath (Join-Path $projectRoot 'node_modules\electron\dist\electron.exe')) -or !(Test-Path -LiteralPath (Join-Path $projectRoot 'node_modules\@tesseract.js-data\eng\index.js'))) {
     if (!$env:ELECTRON_MIRROR) { $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/' }
     & $bunPath install
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 }
-if ($Rebuild -or !(Test-Path -LiteralPath (Join-Path $projectRoot 'apps\electron\dist\main.cjs'))) {
+if ($Rebuild -or !(Test-Path -LiteralPath (Join-Path $projectRoot 'apps\electron\dist\main.cjs')) -or !(Test-Path -LiteralPath (Join-Path $projectRoot 'apps\electron\dist\document-worker.cjs'))) {
     & $bunPath run visaflow:build
     if ($LASTEXITCODE -ne 0) { throw 'VisaFlow build failed.' }
 }
@@ -46,8 +46,10 @@ if (!$NoLaunch) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     $appArgument = '"' + (Join-Path $projectRoot 'apps\electron') + '"'
     $profileArgument = '--user-data-dir="' + (Join-Path $env:CRAFT_CONFIG_DIR 'electron') + '"'
+    $desktopArguments = @($appArgument, $profileArgument)
+    if ($DebugPort -gt 0) { $desktopArguments += '--remote-debugging-port=' + $DebugPort }
     Start-Process -FilePath (Join-Path $projectRoot 'node_modules\electron\dist\electron.exe') `
-        -ArgumentList @($appArgument, $profileArgument) -WorkingDirectory $projectRoot -WindowStyle Normal `
+        -ArgumentList $desktopArguments -WorkingDirectory $projectRoot -WindowStyle Normal `
         -RedirectStandardOutput (Join-Path $logDir 'desktop-stdout.log') `
         -RedirectStandardError (Join-Path $logDir 'desktop-stderr.log') | Out-Null
 }

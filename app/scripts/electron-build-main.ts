@@ -4,8 +4,9 @@
  */
 
 import { spawn } from "bun";
-import { existsSync, readFileSync, statSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync } from "fs";
 import { join } from "path";
+import { buildVisaFlowRecognitionRuntime } from './build-visaflow-recognition-runtime';
 
 const ROOT_DIR = join(import.meta.dir, "..");
 const DIST_DIR = join(ROOT_DIR, "apps/electron/dist");
@@ -394,6 +395,8 @@ async function main(): Promise<void> {
   }
 
   console.log("✅ Build complete and verified");
+  copyFileSync(join(ROOT_DIR, 'packages/visaflow-core/src/document-worker.cjs'), join(DIST_DIR, 'document-worker.cjs'));
+  buildVisaFlowRecognitionRuntime();
   process.exit(0);
 }
 

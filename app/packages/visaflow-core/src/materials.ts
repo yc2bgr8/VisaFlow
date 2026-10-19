@@ -3,6 +3,7 @@ import type { DocumentType, MaterialFields, UploadMaterialInput } from './types.
 
 export const hash = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex')
 const kinds = new Set<DocumentType>(['passport', 'bank_statement', 'application', 'unknown'])
+export const isRecognitionMaterial = (input: UploadMaterialInput): boolean => /\.(pdf|png|jpe?g)$/i.test(input.name)
 
 export function parseMaterial(input: UploadMaterialInput): { text: string; sha256: string; fields: MaterialFields; parseError?: string } {
   if (!input.name?.trim()) throw new Error('材料文件名不能为空')
@@ -13,8 +14,9 @@ export function parseMaterial(input: UploadMaterialInput): { text: string; sha25
   const bytes = Buffer.from(normalized, 'base64')
   if (bytes.length > 8 * 1024 * 1024) throw new Error('演示材料最大 8 MB')
   const sha256 = hash(bytes)
+  if (isRecognitionMaterial(input)) return { text: '', sha256, fields: { documentType: 'unknown' }, parseError: 'PDF / OCR 识别任务排队中，识别字段需要人工确认。' }
   if (!/\.(json|txt|md)$/i.test(input.name) && !/^(application\/json|text\/)/i.test(input.mimeType)) {
-    return { text: '', sha256, fields: { documentType: 'unknown' }, parseError: '本演示解析器支持 JSON / TXT / Markdown；PDF 和图片需要另接 OCR，当前不会猜测文件字段。' }
+    return { text: '', sha256, fields: { documentType: 'unknown' }, parseError: '材料格式不受支持。请上传 JSON、TXT、Markdown、PDF、PNG、JPG 或 JPEG。' }
   }
   const text = bytes.toString('utf8').replace(/^\uFEFF/, '')
   let raw: Record<string, unknown>
